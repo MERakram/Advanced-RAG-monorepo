@@ -82,6 +82,7 @@ else:
 # Import our modules
 from src.ingestion.router import IngestionPipeline
 from src.retrieval.qdrant_client import QdrantRetriever
+from src.retrieval.engine import RetrievalEngine
 from src.generation.semantic_cache import SemanticCache
 from src.generation.agents import AgentFactory
 from src.observability.config import setup_observability, is_langfuse_available
@@ -129,6 +130,7 @@ async def flush_langfuse_middleware(request, call_next):
 # Initialize Components as None (will be lazy-loaded in background)
 ingestion_pipeline = None
 retriever = None
+retrieval_engine = None
 semantic_cache = None
 agent_factory = None
 orchestrator = None
@@ -140,7 +142,7 @@ async def startup_event():
     asyncio.create_task(initialize_components())
 
 async def initialize_components():
-    global ingestion_pipeline, retriever, semantic_cache, agent_factory, orchestrator, is_ready
+    global ingestion_pipeline, retriever, retrieval_engine, semantic_cache, agent_factory, orchestrator, is_ready
     
     print("=" * 50)
     print("Initializing RAG Components in background...")
@@ -157,6 +159,7 @@ async def initialize_components():
         # Initialize heavy components
         # Note: QdrantRetriever has its own internal retry logic
         retriever = QdrantRetriever()
+        retrieval_engine = RetrievalEngine()
         ingestion_pipeline = IngestionPipeline()
         semantic_cache = SemanticCache()
         agent_factory = AgentFactory()
@@ -296,6 +299,75 @@ def _check_vllm_available() -> bool:
     except Exception:
         return False
 
+def _get_rag_context(user_query: str) -> str:
+    """
+    Retrieves relevant document context from Qdrant for the user query.
+    Returns formatted context string to inject into the prompt.
+    """
+    if retrieval_engine is None:
+        return ""
+    
+    try:
+        # Use the retrieval engine (query rewrite + hybrid search + rerank)
+        results = retrieval_engine.query(user_query, use_hyde=False)  # Disable HyDE for speed
+        
+        if not results:
+            return ""
+        
+        # Format context for the LLM
+        context_parts = []
+        for i, doc in enumerate(results[:5]):  # Top 5 documents
+            text = doc.get("text", "")
+            if text:
+                context_parts.append(f"[Document {i+1}]:\n{text[:1500]}")  # Limit each doc
+        
+        if context_parts:
+            return "\n\n---\n\n".join(context_parts)
+        return ""
+    except Exception as e:
+        print(f"Error retrieving RAG context: {e}")
+        return ""
+
+def _augment_messages_with_rag(messages: list, user_query: str) -> list:
+    """
+    Augments the messages with RAG context by adding a system message.
+    """
+    context = _get_rag_context(user_query)
+    
+    if not context:
+        return messages
+    
+    # Create RAG system message content
+    rag_content = f"""You are a helpful assistant with access to a knowledge base. 
+Use the following retrieved documents to answer the user's question.
+If the documents don't contain relevant information, say so and answer based on your general knowledge.
+
+RETRIEVED DOCUMENTS:
+{context}
+
+END OF DOCUMENTS
+
+Now answer the user's question based on the above context."""
+    
+    # Insert RAG context at the beginning (after any existing system message)
+    augmented = list(messages)
+    
+    # Find if there's an existing system message
+    has_system = any(m.role == "system" for m in messages if hasattr(m, 'role'))
+    
+    if has_system:
+        # Add after the first system message
+        for i, m in enumerate(augmented):
+            if hasattr(m, 'role') and m.role == "system":
+                augmented.insert(i + 1, ChatMessage(role="system", content=rag_content))
+                break
+    else:
+        # Add as first message
+        augmented.insert(0, ChatMessage(role="system", content=rag_content))
+    
+    print(f"[RAG] Added context from {len(context)} chars to prompt")
+    return augmented
+
 @app.post("/v1/chat/completions")
 @observe(name="chat_completion") # Langfuse tracing
 async def chat_completions(
@@ -376,8 +448,9 @@ async def chat_completions(
                 response_obj = orchestrator.chat(user_query)
                 response_text = str(response_obj)
             else:
-                # Direct API call for OpenRouter models
-                response_text = await _call_openrouter(request.messages, model_config, stream=False)
+                # For OpenRouter models - add RAG context to messages
+                augmented_messages = _augment_messages_with_rag(request.messages, user_query)
+                response_text = await _call_openrouter(augmented_messages, model_config, stream=False)
             
             # 3. Update Cache (only for substantial responses)
             if len(response_text) > 20:
@@ -415,8 +488,9 @@ async def _stream_response(request: ChatRequest, model_config: ModelConfig, user
                 }
                 yield f"data: {json.dumps(data)}\n\n"
         else:
-            # OpenRouter streaming
-            async for chunk in _stream_openrouter(request.messages, model_config):
+            # OpenRouter streaming - add RAG context to messages
+            augmented_messages = _augment_messages_with_rag(request.messages, user_query)
+            async for chunk in _stream_openrouter(augmented_messages, model_config):
                 full_response += chunk
                 data = {
                     "id": response_id,

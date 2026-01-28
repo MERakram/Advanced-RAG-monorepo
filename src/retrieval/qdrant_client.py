@@ -70,14 +70,20 @@ class QdrantRetriever:
         """
         points = []
         for node in nodes:
+            # Get the text content from the node
+            text_content = node.get_content()
+            
             # Generate Dense Embedding
-            dense_vector = self.embed_model.get_text_embedding(node.get_content())
+            dense_vector = self.embed_model.get_text_embedding(text_content)
             
             # Generate Sparse Vector (BM25-like)
-            # Note: For true BM25 in Qdrant, you often compute it client-side or use a model like SPLADE.
-            # For simplicity here, we'll use a placeholder or a simple frequency map if not using a specific model.
-            # In a real production setup, use 'prithivida/Splade_PP_en_v1' or similar.
-            sparse_vector = self._compute_sparse_vector(node.get_content())
+            sparse_vector = self._compute_sparse_vector(text_content)
+
+            # Create payload with text content + original metadata
+            payload = {
+                "text": text_content,  # Store text for retrieval
+                **(node.metadata or {})
+            }
 
             points.append(models.PointStruct(
                 id=node.node_id,
@@ -85,7 +91,7 @@ class QdrantRetriever:
                     "dense": dense_vector,
                     "sparse": sparse_vector,
                 },
-                payload=node.metadata or {}
+                payload=payload
             ))
             
         self.client.upsert(
@@ -99,15 +105,19 @@ class QdrantRetriever:
         Simple frequency-based sparse vector for demonstration. 
         In production, use a proper SPLADE model.
         """
-        # This is a naive implementation. 
-        # TODO: Integrate a proper SPLADE model for high-quality sparse vectors.
-        from collections import Counter
+        from collections import Counter, defaultdict
         tokens = text.lower().split()
         counts = Counter(tokens)
         
-        # Map tokens to arbitrary indices (hashing) for demo purposes
-        indices = [hash(token) % 100000 for token in counts.keys()]
-        values = list(counts.values())
+        # Map tokens to indices, aggregating values for hash collisions
+        # Qdrant requires unique indices in sparse vectors
+        index_values = defaultdict(float)
+        for token, count in counts.items():
+            idx = abs(hash(token)) % 100000  # Use abs() to ensure positive indices
+            index_values[idx] += count
+        
+        indices = list(index_values.keys())
+        values = [float(v) for v in index_values.values()]
         
         return models.SparseVector(indices=indices, values=values)
 
@@ -120,22 +130,21 @@ class QdrantRetriever:
         query_dense = self.embed_model.get_text_embedding(query)
         query_sparse = self._compute_sparse_vector(query)
 
-        # 2. Search
-        # Qdrant supports hybrid search via prefetch or fusion. 
-        # Here we simply search both and will merge/rerank later.
-        
+        # 2. Search using the new query_points API
         # Dense Search
-        dense_results = self.client.search(
+        dense_results = self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=("dense", query_dense),
+            query=query_dense,
+            using="dense",
             limit=limit,
             with_payload=True
         )
         
         # Sparse Search
-        sparse_results = self.client.search(
+        sparse_results = self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=("sparse", query_sparse),
+            query=query_sparse,
+            using="sparse",
             limit=limit,
             with_payload=True
         )
@@ -144,13 +153,17 @@ class QdrantRetriever:
         seen_ids = set()
         combined = []
         
-        for res in dense_results + sparse_results:
+        # Extract points from QueryResponse
+        dense_points = dense_results.points if hasattr(dense_results, 'points') else []
+        sparse_points = sparse_results.points if hasattr(sparse_results, 'points') else []
+        
+        for res in dense_points + sparse_points:
             if res.id not in seen_ids:
                 combined.append({
                     "id": res.id,
                     "score": res.score,
                     "payload": res.payload,
-                    "text": res.payload.get("text", "") # Assuming text is stored in payload
+                    "text": res.payload.get("text", "") if res.payload else ""
                 })
                 seen_ids.add(res.id)
                 

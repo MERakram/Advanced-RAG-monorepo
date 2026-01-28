@@ -60,6 +60,7 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}
       - PYTHONPATH=.
+      - PYTHONUNBUFFERED=1
     volumes:
       - ./src:/app/src
       - easyocr_models:/root/.EasyOCR
