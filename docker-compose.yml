@@ -11,32 +11,8 @@ services:
     volumes:
       - qdrant_data:/qdrant/storage
     restart: always
-
-  # ---------------------------------------------------------------------------
-  # 2. Local LLM Serving: vLLM
-  # Note: Requires NVIDIA GPU and Docker with GPU support (WSL2 on Windows)
-  # ---------------------------------------------------------------------------
-  vllm:
-    image: vllm/vllm-openai:latest
-    container_name: rag-vllm
-    environment:
-      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
-    # Command to start the server. Adjust model as needed.
-    # Using Qwen2.5-0.5B-Instruct - fast and lightweight (no "thinking" mode like Qwen3).
-    # Reduced GPU memory utilization to 0.85 to avoid OOM on startup.
-    command: --model ${LOCAL_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct} --gpu-memory-utilization 0.85 --dtype auto --api-key local-vllm-key --enforce-eager
-    volumes:
-      - ~/.cache/huggingface:/root/.cache/huggingface
-    ports:
-      - "8001:8000"  # Exposed for direct testing
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    restart: unless-stopped
+    networks:
+      - rag-network
 
   # ---------------------------------------------------------------------------
   # 3. Frontend: Open Web UI
@@ -47,216 +23,23 @@ services:
     ports:
       - "3000:8080"
     environment:
-      # Connect to the RAG Backend (Orchestrator), not vLLM directly
       - OPENAI_API_BASE_URL=http://rag-app:8000/v1
       - OPENAI_API_KEY=local-vllm-key
-      # Optional: Add OpenRouter as a secondary engine or via the UI settings
       - WEBUI_SECRET_KEY=your_secret_key_here
-      # Enable forwarding user/session headers to the backend for Langfuse session tracking
-      # This sends X-OpenWebUI-Chat-Id, X-OpenWebUI-User-Id, etc. headers
       - ENABLE_OPENWEBUI_USER_HEADERS=true
+      # Enable chat title generation
+      - ENABLE_TITLE_GENERATION=true
+      - 'TITLE_GENERATION_PROMPT_TEMPLATE=Create a concise, 3-5 word phrase as a title for the following chat query. RESPOND ONLY WITH THE TITLE TEXT: {{prompt}}'
     volumes:
       - open_webui_data:/app/backend/data
     depends_on:
-      - vllm
-      - rag-app
+      rag-app:
+        condition: service_healthy
     restart: always
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-  # ---------------------------------------------------------------------------
-  # 4. Observability: Langfuse (v3) with MinIO & Redis
-  # ---------------------------------------------------------------------------
-  langfuse-db:
-    image: postgres:16
-    container_name: rag-langfuse-db
-    environment:
-      - POSTGRES_USER=langfuse
-      - POSTGRES_PASSWORD=langfuse
-      - POSTGRES_DB=langfuse
-    volumes:
-      - langfuse_db_data:/var/lib/postgresql/data
-    restart: always
-
-  zookeeper:
-    image: zookeeper:3.7
-    container_name: rag-zookeeper
-    restart: always
-
-  clickhouse:
-    image: clickhouse/clickhouse-server:24.3.3.102-alpine
-    container_name: rag-clickhouse
-    depends_on:
-      - zookeeper
-    environment:
-      - CLICKHOUSE_DB=default
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
-      - CLICKHOUSE_PASSWORD=myclickhousepassword
-    ports:
-      - "18123:8123"
-      - "19000:9000"
-    volumes:
-      - clickhouse_data:/var/lib/clickhouse
-      - ./clickhouse_config.xml:/etc/clickhouse-server/config.d/zookeeper.xml
-    restart: always
-
-  redis:
-    image: redis:7.2
-    container_name: rag-redis
-    restart: always
-
-  minio:
-    image: minio/minio
-    container_name: rag-minio
-    command: server /data --console-address ":9001"
-    environment:
-      - MINIO_ROOT_USER=minio
-      - MINIO_ROOT_PASSWORD=minio123
-    ports:
-      - "9000:9000"
-      - "9001:9001"
-    volumes:
-      - minio_data:/data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
-    restart: always
-
-  # MinIO bucket initialization - creates required buckets on startup
-  minio-init:
-    image: minio/mc
-    container_name: rag-minio-init
-    depends_on:
-      minio:
-        condition: service_started
-    entrypoint: >
-      /bin/sh -c "
-      sleep 5;
-      mc alias set myminio http://minio:9000 minio minio123;
-      mc mb myminio/langfuse --ignore-existing;
-      mc anonymous set public myminio/langfuse;
-      echo 'MinIO bucket langfuse created successfully';
-      exit 0;
-      "
-
-  langfuse:
-    image: langfuse/langfuse:3.136.0
-    container_name: rag-langfuse
-    depends_on:
-      - langfuse-db
-      - clickhouse
-      - redis
-      - minio
-      - minio-init
-    ports:
-      - "3001:3000"
-    environment:
-      - NODE_ENV=production
-      - NEXTAUTH_URL=http://localhost:3001
-      - NEXTAUTH_SECRET=mysecret
-      - SALT=mysalt
-      - ENCRYPTION_KEY=662d049094d9d51089db30f63960651994633d53171a96e24b7f637c5280d289
-      - TELEMETRY_ENABLED=false
-      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=true
-
-      # Database
-      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
-
-      # ClickHouse
-      - CLICKHOUSE_URL=http://clickhouse:8123
-      - CLICKHOUSE_MIGRATION_URL=clickhouse://default:myclickhousepassword@clickhouse:9000
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=myclickhousepassword
-
-      # Redis
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_AUTH=
-
-      # MinIO (S3)
-      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
-      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
-      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
-      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=minio123
-      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
-      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
-      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
-
-      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
-      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
-      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
-      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=minio123
-      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://minio:9000
-      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
-      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
-
-      # Headless Initialization - Auto-create organization, project, user and API keys
-      - LANGFUSE_INIT_ORG_ID=rag-org
-      - LANGFUSE_INIT_ORG_NAME=RAG Organization
-      - LANGFUSE_INIT_PROJECT_ID=rag-project
-      - LANGFUSE_INIT_PROJECT_NAME=Advanced RAG
-      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-rag-default-public-key
-      - LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-rag-default-secret-key
-      - LANGFUSE_INIT_USER_EMAIL=admin@rag.local
-      - LANGFUSE_INIT_USER_NAME=RAG Admin
-      - LANGFUSE_INIT_USER_PASSWORD=ragadmin123
-    restart: always
-
-  # Langfuse Worker - Required for processing events from S3 to ClickHouse
-  # IMPORTANT: Uses a separate worker image, not the main langfuse image!
-  langfuse-worker:
-    image: langfuse/langfuse-worker:3
-    container_name: rag-langfuse-worker
-    depends_on:
-      - langfuse
-      - clickhouse
-      - redis
-      - minio
-    ports:
-      - "3030:3030"
-    environment:
-      - NEXTAUTH_URL=http://localhost:3001
-      - NEXTAUTH_SECRET=mysecret
-      - SALT=mysalt
-      - ENCRYPTION_KEY=662d049094d9d51089db30f63960651994633d53171a96e24b7f637c5280d289
-      - TELEMETRY_ENABLED=false
-      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=true
-      
-      # Database
-      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
-      
-      # ClickHouse
-      - CLICKHOUSE_URL=http://clickhouse:8123
-      - CLICKHOUSE_MIGRATION_URL=clickhouse://default:myclickhousepassword@clickhouse:9000
-      - CLICKHOUSE_USER=default
-      - CLICKHOUSE_PASSWORD=myclickhousepassword
-      - CLICKHOUSE_CLUSTER_ENABLED=false
-      
-      # Redis - for queue processing
-      - REDIS_HOST=redis
-      - REDIS_PORT=6379
-      - REDIS_AUTH=
-      
-      # MinIO (S3) - for reading events
-      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
-      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
-      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
-      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=minio123
-      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
-      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
-      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
-      
-      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
-      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
-      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
-      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=minio123
-      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://minio:9000
-      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
-      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
-    restart: always
+    networks:
+      - rag-network
 
   # ---------------------------------------------------------------------------
   # 5. Main Application (The RAG Pipeline)
@@ -265,29 +48,31 @@ services:
     build: .
     container_name: rag-backend
     ports:
-      - "5001:8000"
+      - "5002:8000"
     environment:
       - QDRANT_URL=http://qdrant:6333
       - VLLM_URL=http://vllm:8000/v1
-      # Langfuse configuration - hardcoded to internal Docker port (NOT from .env)
       - LANGFUSE_HOST=http://langfuse:3000
       - LANGFUSE_BASE_URL=http://langfuse:3000
       - LANGFUSE_PUBLIC_KEY=pk-lf-rag-default-public-key
       - LANGFUSE_SECRET_KEY=sk-lf-rag-default-secret-key
-      - LANGFUSE_DEBUG=true
+      - LANGFUSE_DEBUG=${LANGFUSE_DEBUG:-false}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY}
       - LOCAL_MODEL_NAME=${LOCAL_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct}
       - PYTHONPATH=.
     volumes:
       - ./src:/app/src
-      # Model cache volumes (downloaded at runtime)
       - easyocr_models:/root/.EasyOCR
       - docling_models:/root/.cache/docling
       - huggingface_models:/root/.cache/huggingface
     depends_on:
       - qdrant
-      - vllm
-      - langfuse
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8000/health || curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
     deploy:
       resources:
         reservations:
@@ -295,15 +80,18 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
-    # Start the API server
     command: uvicorn src.main:app --host 0.0.0.0 --port 8000
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    name: rag-network
 
 volumes:
   qdrant_data:
   open_webui_data:
-  langfuse_db_data:
-  clickhouse_data:
-  minio_data:
   easyocr_models:
   docling_models:
   huggingface_models:
+    name: huggingface_models

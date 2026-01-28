@@ -16,6 +16,23 @@ class QdrantRetriever:
             url=os.getenv("QDRANT_URL", "http://localhost:6333")
         )
         
+        # Connection retry logic
+        import time
+        max_retries = 12
+        retry_interval = 5
+        for i in range(max_retries):
+            try:
+                # Simple check to see if qdrant is responsive
+                self.client.get_collections()
+                print(f"Successfully connected to Qdrant (attempt {i+1}/{max_retries})")
+                break
+            except Exception as e:
+                print(f"Qdrant connection failed (attempt {i+1}/{max_retries}): {e}")
+                if i < max_retries - 1:
+                    time.sleep(retry_interval)
+                else:
+                    print("Could not connect to Qdrant after multiple attempts.")
+        
         # Use local HuggingFace embedding model (no API key required)
         # all-MiniLM-L6-v2 produces 384-dimensional embeddings
         self.embed_model = HuggingFaceEmbedding(

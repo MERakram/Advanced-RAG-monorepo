@@ -1,6 +1,8 @@
 import os
 import time
 import json
+import asyncio
+import urllib.request
 from typing import List, Optional, AsyncGenerator
 from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,21 +10,81 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from openai import OpenAI  # Use standard OpenAI client
 
-# Initialize Langfuse v3 for tracing
+# =============================================================================
+# CRITICAL: Pre-check Langfuse reachability BEFORE importing langfuse
+# The langfuse SDK auto-initializes OpenTelemetry on import, which will cause
+# continuous connection errors if Langfuse is not reachable.
+# =============================================================================
+def _pre_check_langfuse() -> bool:
+    """Check if Langfuse is reachable before importing the SDK."""
+    host = os.getenv("LANGFUSE_HOST", "http://localhost:3000")
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    
+    # If no credentials, skip
+    if not (public_key and secret_key):
+        return False
+    
+    try:
+        health_url = f"{host}/api/public/health"
+        req = urllib.request.Request(health_url, method="GET")
+        with urllib.request.urlopen(req, timeout=3) as response:
+            return response.status == 200
+    except Exception:
+        return False
+
+# Disable OTEL before any langfuse imports if Langfuse is not reachable
+_langfuse_enabled = _pre_check_langfuse()
+if not _langfuse_enabled:
+    os.environ["OTEL_SDK_DISABLED"] = "true"
+    # Suppress noisy Langfuse/OTEL logs when disabled
+    import logging
+    logging.getLogger("langfuse").setLevel(logging.ERROR)
+    logging.getLogger("opentelemetry").setLevel(logging.ERROR)
+    logging.getLogger("opentelemetry.sdk").setLevel(logging.ERROR)
+    print("Langfuse not reachable - tracing disabled")
+
+# Initialize Langfuse v3 for tracing (optional - may not be available)
 # SDK v3 uses get_client() to access the global client instance
 # configured via environment variables (LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST)
-from langfuse import observe, get_client, Langfuse, propagate_attributes
 
-# Get the global Langfuse client (automatically configured from env vars)
-# Set debug=True via environment variable LANGFUSE_DEBUG=true for debugging
-langfuse = get_client()
+# Dummy context manager for when Langfuse is disabled
+class _DummyContextManager:
+    def __enter__(self): return self
+    def __exit__(self, *args): pass
+    def update(self, **kwargs): pass
+
+# Dummy client that does nothing but prevents AttributeError
+class _DummyLangfuseClient:
+    def update_current_trace(self, **kwargs): pass
+    def start_as_current_observation(self, **kwargs): return _DummyContextManager()
+    def flush(self): pass
+    def shutdown(self): pass
+    def score(self, **kwargs): pass
+
+if _langfuse_enabled:
+    try:
+        from langfuse import observe, get_client, Langfuse, propagate_attributes
+        langfuse = get_client()
+    except Exception:
+        # Langfuse import failed - use dummies
+        observe = lambda *args, **kwargs: (lambda f: f)
+        get_client = lambda: _DummyLangfuseClient()
+        propagate_attributes = lambda **kwargs: _DummyContextManager()
+        langfuse = None
+else:
+    # Langfuse not reachable - use dummy decorators and client
+    observe = lambda *args, **kwargs: (lambda f: f)
+    get_client = lambda: _DummyLangfuseClient()
+    propagate_attributes = lambda **kwargs: _DummyContextManager()
+    langfuse = None
 
 # Import our modules
 from src.ingestion.router import IngestionPipeline
 from src.retrieval.qdrant_client import QdrantRetriever
 from src.generation.semantic_cache import SemanticCache
 from src.generation.agents import AgentFactory
-from src.observability.config import setup_observability
+from src.observability.config import setup_observability, is_langfuse_available
 from src.config import (
     get_all_models, get_model_by_id, get_default_model,
     get_provider_config, Provider, ModelConfig
@@ -39,50 +101,94 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Suppress noisy /health access logs from uvicorn
+import logging
+
+class HealthCheckFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "GET /health" not in record.getMessage()
+
+logging.getLogger("uvicorn.access").addFilter(HealthCheckFilter())
+
 # Middleware to flush Langfuse after each request
 @app.middleware("http")
 async def flush_langfuse_middleware(request, call_next):
     response = await call_next(request)
-    # Flush Langfuse traces after each request to ensure they're sent
-    # In SDK v3, get_client() returns the global client
-    try:
-        get_client().flush()
-    except Exception as e:
-        print(f"Error flushing Langfuse: {e}")
+    # Skip flushing for health checks and when Langfuse is not available
+    if request.url.path != "/health" and is_langfuse_available():
+        # Flush Langfuse traces after each request to ensure they're sent
+        try:
+            client = get_client()
+            if client:
+                client.flush()
+        except Exception:
+            # Silently ignore flush errors
+            pass
     return response
 
-# Initialize other Components
-setup_observability() # Initialize LlamaIndex tracing
-
-ingestion_pipeline = IngestionPipeline()
-retriever = QdrantRetriever() # Used for upserting chunks
-semantic_cache = SemanticCache()
-agent_factory = AgentFactory()
-orchestrator = agent_factory.create_orchestrator()
+# Initialize Components as None (will be lazy-loaded in background)
+ingestion_pipeline = None
+retriever = None
+semantic_cache = None
+agent_factory = None
+orchestrator = None
+is_ready = False
 
 @app.on_event("startup")
 async def startup_event():
+    # Start initialization in background so healthcheck can start working
+    asyncio.create_task(initialize_components())
+
+async def initialize_components():
+    global ingestion_pipeline, retriever, semantic_cache, agent_factory, orchestrator, is_ready
+    
     print("=" * 50)
-    print("Langfuse Configuration:")
+    print("Initializing RAG Components in background...")
     print(f"  LANGFUSE_HOST: {os.getenv('LANGFUSE_HOST', 'not set')}")
     print(f"  LANGFUSE_BASE_URL: {os.getenv('LANGFUSE_BASE_URL', 'not set')}")
     print(f"  LANGFUSE_PUBLIC_KEY: {os.getenv('LANGFUSE_PUBLIC_KEY', 'not set')[:20]}...")
     print(f"  LANGFUSE_SECRET_KEY: {'set' if os.getenv('LANGFUSE_SECRET_KEY') else 'not set'}")
     print("=" * 50)
-    # Verify Langfuse connection
+
     try:
-        auth_result = langfuse.auth_check()
-        print(f"Langfuse auth check: {auth_result}")
+        # Initialize LlamaIndex tracing
+        setup_observability()
+        
+        # Initialize heavy components
+        # Note: QdrantRetriever has its own internal retry logic
+        retriever = QdrantRetriever()
+        ingestion_pipeline = IngestionPipeline()
+        semantic_cache = SemanticCache()
+        agent_factory = AgentFactory()
+        orchestrator = agent_factory.create_orchestrator()
+        
+        # Mark as ready - core components are initialized
+        is_ready = True
+        print("Core components initialized. System IS READY.")
+        
+        # Log Langfuse status (already checked in setup_observability)
+        if is_langfuse_available():
+            print("Langfuse tracing is enabled.")
+        else:
+            print("Langfuse tracing is disabled (server not available).")
+        
+        print("Backend initialization complete.")
     except Exception as e:
-        print(f"Langfuse auth check failed: {e}")
+        print(f"CRITICAL ERROR during background initialization: {e}")
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
     # Flush and shutdown Langfuse client before application shutdown
-    # SDK v3 recommends calling shutdown() for clean resource release
-    client = get_client()
-    client.shutdown()
-    print("Langfuse shutdown successfully")
+    # Only if Langfuse is available
+    if is_langfuse_available():
+        try:
+            client = get_client()
+            if client:
+                client.shutdown()
+                print("Langfuse shutdown successfully")
+        except Exception:
+            pass
 
 # --- Pydantic Models ---
 
@@ -106,7 +212,10 @@ class ChatResponse(BaseModel):
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    if is_ready:
+        return {"status": "healthy"}
+    else:
+        raise HTTPException(status_code=503, detail="System is still initializing components in the background.")
 
 @app.get("/test-langfuse")
 @observe(name="test_langfuse_trace")
@@ -138,11 +247,23 @@ def test_langfuse():
 def list_models():
     """
     Returns available models for Open Web UI.
-    Reads from centralized config (src/config.py).
+    Filters models based on provider availability:
+    - vLLM models: only if vLLM server is reachable
+    - OpenRouter models: only if API key is configured
     """
     models_data = []
     
+    # Check provider availability
+    vllm_available = _check_vllm_available()
+    openrouter_available = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    
     for model in get_all_models():
+        # Skip unavailable providers
+        if model.provider == Provider.VLLM and not vllm_available:
+            continue
+        if model.provider == Provider.OPENROUTER and not openrouter_available:
+            continue
+            
         models_data.append({
             "id": model.id,
             "object": "model",
@@ -157,6 +278,23 @@ def list_models():
         "object": "list",
         "data": models_data
     }
+
+
+def _check_vllm_available() -> bool:
+    """Check if vLLM server is reachable."""
+    import urllib.request
+    import urllib.error
+    
+    vllm_url = os.getenv("VLLM_URL", "http://localhost:8000/v1")
+    # Convert /v1 endpoint to health check
+    health_url = vllm_url.replace("/v1", "/health")
+    
+    try:
+        req = urllib.request.Request(health_url, method="GET")
+        with urllib.request.urlopen(req, timeout=2) as response:
+            return response.status == 200
+    except Exception:
+        return False
 
 @app.post("/v1/chat/completions")
 @observe(name="chat_completion") # Langfuse tracing

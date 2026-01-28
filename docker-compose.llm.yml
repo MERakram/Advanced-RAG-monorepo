@@ -1,0 +1,32 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 2. Local LLM Serving: vLLM
+  # ---------------------------------------------------------------------------
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: rag-vllm
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HUGGING_FACE_HUB_TOKEN}
+    command: --model ${LOCAL_MODEL_NAME:-Qwen/Qwen2.5-0.5B-Instruct} --gpu-memory-utilization 0.85 --dtype auto --api-key local-vllm-key --enforce-eager
+    volumes:
+      - huggingface_models:/root/.cache/huggingface
+    ports:
+      - "8001:8000"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    name: rag-network
+
+volumes:
+  huggingface_models:
+    name: huggingface_models

@@ -1,0 +1,205 @@
+services:
+  # ---------------------------------------------------------------------------
+  # 4. Observability: Langfuse (v3) with MinIO & Redis
+  # ---------------------------------------------------------------------------
+  langfuse-db:
+    image: postgres:16
+    container_name: rag-langfuse-db
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    restart: always
+    networks:
+      - rag-network
+
+  zookeeper:
+    image: zookeeper:3.7
+    container_name: rag-zookeeper
+    restart: always
+    networks:
+      - rag-network
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3.3.102-alpine
+    container_name: rag-clickhouse
+    depends_on:
+      - zookeeper
+    environment:
+      - CLICKHOUSE_DB=default
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT=1
+      - CLICKHOUSE_PASSWORD=myclickhousepassword
+    ports:
+      - "18123:8123"
+      - "19000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse_config.xml:/etc/clickhouse-server/config.d/zookeeper.xml
+    restart: always
+    networks:
+      - rag-network
+
+  redis:
+    image: redis:7.2
+    container_name: rag-redis
+    restart: always
+    networks:
+      - rag-network
+
+  minio:
+    image: minio/minio
+    container_name: rag-minio
+    command: server /data --console-address ":9001"
+    environment:
+      - MINIO_ROOT_USER=minio
+      - MINIO_ROOT_PASSWORD=minio123
+    ports:
+      - "9090:9000"
+      - "9091:9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: always
+    networks:
+      - rag-network
+
+  minio-init:
+    image: minio/mc
+    container_name: rag-minio-init
+    depends_on:
+      minio:
+        condition: service_started
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set myminio http://minio:9000 minio minio123;
+      mc mb myminio/langfuse --ignore-existing;
+      mc anonymous set public myminio/langfuse;
+      echo 'MinIO bucket langfuse created successfully';
+      exit 0;
+      "
+    networks:
+      - rag-network
+
+  langfuse:
+    image: langfuse/langfuse:3.136.0
+    container_name: rag-langfuse
+    depends_on:
+      - langfuse-db
+      - clickhouse
+      - redis
+      - minio
+      - minio-init
+    ports:
+      - "3001:3000"
+    environment:
+      - NODE_ENV=production
+      - NEXTAUTH_URL=http://localhost:3001
+      - NEXTAUTH_SECRET=mysecret
+      - SALT=mysalt
+      - ENCRYPTION_KEY=662d049094d9d51089db30f63960651994633d53171a96e24b7f637c5280d289
+      - TELEMETRY_ENABLED=false
+      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=true
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://default:myclickhousepassword@clickhouse:9000
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=myclickhousepassword
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_AUTH=
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=minio123
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=minio123
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
+      - LANGFUSE_INIT_ORG_ID=rag-org
+      - LANGFUSE_INIT_ORG_NAME=RAG Organization
+      - LANGFUSE_INIT_PROJECT_ID=rag-project
+      - LANGFUSE_INIT_PROJECT_NAME=Advanced RAG
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-rag-default-public-key
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-rag-default-secret-key
+      - LANGFUSE_INIT_USER_EMAIL=admin@rag.local
+      - LANGFUSE_INIT_USER_NAME=RAG Admin
+      - LANGFUSE_INIT_USER_PASSWORD=ragadmin123
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    restart: always
+    networks:
+      - rag-network
+
+  langfuse-worker:
+    image: langfuse/langfuse-worker:3
+    container_name: rag-langfuse-worker
+    depends_on:
+      - langfuse
+      - clickhouse
+      - redis
+      - minio
+    ports:
+      - "3030:3030"
+    environment:
+      - NEXTAUTH_URL=http://localhost:3001
+      - NEXTAUTH_SECRET=mysecret
+      - SALT=mysalt
+      - ENCRYPTION_KEY=662d049094d9d51089db30f63960651994633d53171a96e24b7f637c5280d289
+      - TELEMETRY_ENABLED=false
+      - LANGFUSE_ENABLE_EXPERIMENTAL_FEATURES=true
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      - CLICKHOUSE_URL=http://clickhouse:8123
+      - CLICKHOUSE_MIGRATION_URL=clickhouse://default:myclickhousepassword@clickhouse:9000
+      - CLICKHOUSE_USER=default
+      - CLICKHOUSE_PASSWORD=myclickhousepassword
+      - CLICKHOUSE_CLUSTER_ENABLED=false
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - REDIS_AUTH=
+      - LANGFUSE_S3_EVENT_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_EVENT_UPLOAD_REGION=auto
+      - LANGFUSE_S3_EVENT_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_EVENT_UPLOAD_SECRET_ACCESS_KEY=minio123
+      - LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_EVENT_UPLOAD_PREFIX=events/
+      - LANGFUSE_S3_MEDIA_UPLOAD_BUCKET=langfuse
+      - LANGFUSE_S3_MEDIA_UPLOAD_REGION=auto
+      - LANGFUSE_S3_MEDIA_UPLOAD_ACCESS_KEY_ID=minio
+      - LANGFUSE_S3_MEDIA_UPLOAD_SECRET_ACCESS_KEY=minio123
+      - LANGFUSE_S3_MEDIA_UPLOAD_ENDPOINT=http://minio:9000
+      - LANGFUSE_S3_MEDIA_UPLOAD_FORCE_PATH_STYLE=true
+      - LANGFUSE_S3_MEDIA_UPLOAD_PREFIX=media/
+    restart: always
+    networks:
+      - rag-network
+
+networks:
+  rag-network:
+    name: rag-network
+
+volumes:
+  langfuse_db_data:
+    name: langfuse_db_data
+  clickhouse_data:
+    name: clickhouse_data
+  minio_data:
+    name: minio_data

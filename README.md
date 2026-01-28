@@ -32,7 +32,7 @@ A production-ready **Retrieval-Augmented Generation (RAG)** platform featuring l
                                     ▼
 ┌────────────────────────────────────────────────────────────────────────┐
 │                         RAG Backend (FastAPI)                          │
-│                           (localhost:5001)                             │
+│                           (localhost:5002)                             │
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐    │
 │  │  Semantic   │  │   Query     │  │  Re-Ranker  │  │   Model     │    │
 │  │   Cache     │  │  Rewriting  │  │  (Cross-Enc)│  │   Router    │    │
@@ -62,13 +62,13 @@ A production-ready **Retrieval-Augmented Generation (RAG)** platform featuring l
 | Container             | Image                           | Port      | Purpose                    |
 | --------------------- | ------------------------------- | --------- | -------------------------- |
 | `rag-open-webui`      | `ghcr.io/open-webui/open-webui` | 3000      | Chat UI (like ChatGPT)     |
-| `rag-backend`         | Custom (Dockerfile)             | 5001      | FastAPI RAG orchestrator   |
+| `rag-backend`         | Custom (Dockerfile)             | 5002      | FastAPI RAG orchestrator   |
 | `rag-vllm`            | `vllm/vllm-openai`              | 9999      | Local LLM inference        |
 | `rag-qdrant`          | `qdrant/qdrant`                 | 6333      | Vector database            |
 | `rag-langfuse`        | `langfuse/langfuse:3`           | 3001      | Observability UI           |
 | `rag-langfuse-worker` | `langfuse/langfuse-worker:3`    | 3030      | Trace processing           |
 | `rag-clickhouse`      | `clickhouse/clickhouse-server`  | 18123     | Trace storage (OLAP)       |
-| `rag-minio`           | `minio/minio`                   | 9000/9001 | S3-compatible blob storage |
+| `rag-minio`           | `minio/minio`                   | 9090/9091 | S3-compatible blob storage |
 | `rag-redis`           | `redis:7.2`                     | 6379      | Queue & cache              |
 | `rag-langfuse-db`     | `postgres:16`                   | -         | Langfuse metadata DB       |
 
@@ -103,7 +103,7 @@ docker compose up -d
 
 - **Chat UI**: http://localhost:3000 (Open WebUI)
 - **Langfuse Dashboard**: http://localhost:3001
-- **API Docs**: http://localhost:5001/docs
+- **API Docs**: http://localhost:5002/docs
 
 ### Default Langfuse Credentials
 
@@ -211,6 +211,41 @@ poetry install
 
 # Start backend
 poetry run uvicorn src.main:app --reload --port 8000
+```
+
+### Poetry Convenience Scripts
+
+After running `poetry install`, you can use these commands to manage Docker services:
+
+| Command                 | Description                                   |
+| ----------------------- | --------------------------------------------- |
+| `poetry run llm-up`     | Start vLLM service (local LLM inference)      |
+| `poetry run llm-down`   | Stop vLLM service                             |
+| `poetry run trace-up`   | Start Langfuse + dependencies (observability) |
+| `poetry run trace-down` | Stop Langfuse + dependencies                  |
+| `poetry run app-up`     | Start RAG backend + Qdrant + Open WebUI       |
+| `poetry run app-build`  | Rebuild and start the RAG backend             |
+| `poetry run app-down`   | Stop RAG backend + Qdrant + Open WebUI        |
+| `poetry run start-all`  | 🚀 Start all services                         |
+| `poetry run stop-all`   | Stop all services                             |
+| `poetry run status`     | Show status of all containers                 |
+
+**Example workflow:**
+
+```bash
+# Start everything at once
+poetry run start-all
+
+# Or start services individually
+poetry run trace-up      # Start observability first
+poetry run llm-up        # Start local LLM
+poetry run app-up        # Start the RAG application
+
+# Check what's running
+poetry run status
+
+# Stop everything
+poetry run stop-all
 ```
 
 ### Adding New Models
